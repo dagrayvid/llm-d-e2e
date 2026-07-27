@@ -522,6 +522,117 @@ def test_new_testcase_script_generates_loadable_config(tmp_path, monkeypatch):
     assert manifest["spec"]["replicas"] == 1
 
 
+def test_wait_for_ready_surfaces_operator_image_pull_errors(monkeypatch):
+    """When wait_for_ready hits a persistent error and operator pods have
+    ImagePullBackOff, the error message should include the failing image."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    def fake_kubectl(*args, **kwargs):
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                return "SchedulerReconcileError"
+            if "message}" in str(arg):
+                return "failed to reconcile scheduler resources"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        d,
+        "_check_operator_image_issues",
+        lambda: [
+            "redhat-ods-applications/kserve-module-controller-manager-abc: "
+            "ImagePullBackOff (quay.io/rhoai/odh-kserve-module-operator-rhel9:latest)"
+        ],
+    )
+
+    logs = []
+    with pytest.raises(RuntimeError, match=r"(?s)Operator image pull failures.*ImagePullBackOff.*kserve-module"):
+        d.wait_for_ready(tc, timeout=600, print_fn=logs.append)
+
+    assert any("WARNING" in line and "ImagePullBackOff" in line for line in logs), (
+        f"Expected WARNING about ImagePullBackOff in logs, got: {logs}"
+    )
+
+
+def test_wait_for_ready_timeout_includes_image_pull_errors(monkeypatch):
+    """When wait_for_ready times out (no persistent error detected), the
+    TimeoutError should still include operator ImagePullBackOff info."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    poll = 0
+
+    def fake_kubectl(*args, **kwargs):
+        nonlocal poll
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                poll += 1
+                return f"TransientReason{poll}"
+            if "message}" in str(arg):
+                return f"retrying attempt {poll}"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        d,
+        "_check_operator_image_issues",
+        lambda: ["redhat-ods-applications/bad-operator-pod-xyz: ErrImagePull (quay.io/rhoai/some-private-image:v1)"],
+    )
+
+    with pytest.raises(TimeoutError, match=r"(?s)Operator image pull failures.*ErrImagePull.*some-private-image"):
+        d.wait_for_ready(tc, timeout=0.01, print_fn=lambda _: None)
+
+
+def test_check_operator_image_issues_returns_empty_when_healthy(monkeypatch):
+    """No false positives when all operator pods are healthy."""
+    from conformance.deployer import Deployer
+
+    d = Deployer()
+
+    def fake_kubectl(*args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    assert d._check_operator_image_issues() == []
+
+
+def test_check_operator_image_issues_parses_image_pull_back_off(monkeypatch):
+    """_check_operator_image_issues correctly parses ImagePullBackOff from kubectl output."""
+    from conformance.deployer import Deployer
+
+    d = Deployer()
+
+    def fake_kubectl(*args, **kwargs):
+        joined = " ".join(str(a) for a in args)
+        if "redhat-ods-applications" in joined:
+            return "kserve-ctrl-abc|ImagePullBackOff=quay.io/rhoai/private-img:v1 |"
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    issues = d._check_operator_image_issues()
+    assert len(issues) == 1
+    assert "ImagePullBackOff" in issues[0]
+    assert "quay.io/rhoai/private-img:v1" in issues[0]
+    assert "kserve-ctrl-abc" in issues[0]
+
+
 def test_new_testcase_script_rejects_duplicate(tmp_path, monkeypatch):
     """new-testcase.sh must refuse to overwrite an existing config."""
     import subprocess

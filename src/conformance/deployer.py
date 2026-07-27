@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 WORKLOAD_LABEL = "app.kubernetes.io/name={name},app.kubernetes.io/component=llminferenceservice-workload"
 PREFILL_LABEL = "app.kubernetes.io/name={name},app.kubernetes.io/component=llminferenceservice-workload-prefill"
 
+OPERATOR_NAMESPACES = ("redhat-ods-applications", "redhat-ods-operator", "rhaii")
+_IMAGE_PULL_FAILURE_REASONS = ("ImagePullBackOff", "ErrImagePull")
+
 
 def _parse_node_selector(value: str) -> dict[str, str]:
     """Parse 'key=value' into a dict, or return empty dict."""
@@ -434,10 +437,18 @@ class Deployer:
                         _error_repeat_count = 1
                     if _error_repeat_count >= 3:
                         detail = f"reason={reason}: {message}"
+                        image_issues = self._check_operator_image_issues()
+                        if image_issues:
+                            detail += "\nOperator image pull failures:\n  " + "\n  ".join(image_issues)
                         raise RuntimeError(f"Persistent controller error for {name}: {detail}")
                 else:
                     _prev_error_key = None
                     _error_repeat_count = 0
+
+                if print_fn and _error_repeat_count == 1:
+                    image_issues = self._check_operator_image_issues()
+                    for issue in image_issues:
+                        print_fn(f"WARNING: {issue}")
 
                 crash_pods = self._check_crashloop(name)
                 if crash_pods:
@@ -458,6 +469,9 @@ class Deployer:
         detail = f"last reason={last_reason}"
         if last_message:
             detail += f": {last_message}"
+        image_issues = self._check_operator_image_issues()
+        if image_issues:
+            detail += "\nOperator image pull failures:\n  " + "\n  ".join(image_issues)
         raise TimeoutError(f"{name} not ready after {timeout}s ({detail})")
 
     def _check_crashloop(self, name: str) -> list[str]:
@@ -479,6 +493,34 @@ class Deployer:
             if len(parts) == 2 and "CrashLoopBackOff" in parts[1]:
                 crash_pods.append(parts[0])
         return crash_pods
+
+    def _check_operator_image_issues(self) -> list[str]:
+        """Scan operator namespaces for pods stuck in ImagePullBackOff/ErrImagePull."""
+        issues = []
+        for ns in OPERATOR_NAMESPACES:
+            output = self.kubectl(
+                "get",
+                "pods",
+                "-n",
+                ns,
+                "-o",
+                "jsonpath={range .items[*]}{.metadata.name}|"
+                "{range .status.containerStatuses[*]}{.state.waiting.reason}={.image} {end}|"
+                "{range .status.initContainerStatuses[*]}{.state.waiting.reason}={.image} {end}"
+                "\\n{end}",
+                check=False,
+            )
+            for line in (output or "").strip().splitlines():
+                parts = line.split("|")
+                if len(parts) < 2:
+                    continue
+                pod_name = parts[0].strip()
+                for container_info in " ".join(parts[1:]).split():
+                    for reason in _IMAGE_PULL_FAILURE_REASONS:
+                        if container_info.startswith(f"{reason}="):
+                            image = container_info.split("=", 1)[1]
+                            issues.append(f"{ns}/{pod_name}: {reason} ({image})")
+        return issues
 
     def wait_for_service(self, name: str, timeout: float = 300) -> str:
         deadline = time.time() + timeout
