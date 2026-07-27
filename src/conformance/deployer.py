@@ -366,6 +366,11 @@ class Deployer:
         name = tc.name
         start = time.time()
         crashloop_count = 0
+        # Track any persistent Ready=False condition with a stable reason+message
+        _prev_error_key: str | None = None
+        _error_repeat_count = 0
+        last_reason = ""
+        last_message = ""
 
         while time.time() < deadline:
             elapsed = int(time.time() - start)
@@ -393,10 +398,46 @@ class Deployer:
                     )
                     or "waiting"
                 )
+                message = (
+                    self.kubectl(
+                        "get",
+                        "llminferenceservice",
+                        name,
+                        "-n",
+                        self.namespace,
+                        "-o",
+                        "jsonpath={.status.conditions[?(@.type=='Ready')].message}",
+                        check=False,
+                    )
+                    or ""
+                )
+                last_reason = reason
+                last_message = message
                 if print_fn:
-                    print_fn(f"[{elapsed}s/{int(timeout)}s] Ready={status or 'Unknown'} reason={reason}")
+                    log_line = f"[{elapsed}s/{int(timeout)}s] Ready={status or 'Unknown'} reason={reason}"
+                    if message:
+                        log_line += f" message={message}"
+                    print_fn(log_line)
                 if status == "True":
                     return True
+
+                # Fail fast on any persistent controller error: if the same
+                # non-empty reason+message pair repeats across 3 consecutive
+                # polls (~45s), the error is unlikely to self-heal (RBAC,
+                # missing CRD, webhook misconfiguration, etc.).
+                if status == "False" and reason != "waiting" and message:
+                    error_key = f"{reason}:{message}"
+                    if error_key == _prev_error_key:
+                        _error_repeat_count += 1
+                    else:
+                        _prev_error_key = error_key
+                        _error_repeat_count = 1
+                    if _error_repeat_count >= 3:
+                        detail = f"reason={reason}: {message}"
+                        raise RuntimeError(f"Persistent controller error for {name}: {detail}")
+                else:
+                    _prev_error_key = None
+                    _error_repeat_count = 0
 
                 crash_pods = self._check_crashloop(name)
                 if crash_pods:
@@ -414,7 +455,10 @@ class Deployer:
                     print_fn(f"[{elapsed}s/{int(timeout)}s] resource not found yet")
             time.sleep(15)
 
-        raise TimeoutError(f"{name} not ready after {timeout}s")
+        detail = f"last reason={last_reason}"
+        if last_message:
+            detail += f": {last_message}"
+        raise TimeoutError(f"{name} not ready after {timeout}s ({detail})")
 
     def _check_crashloop(self, name: str) -> list[str]:
         """Return pod names in CrashLoopBackOff for this LLMInferenceService."""

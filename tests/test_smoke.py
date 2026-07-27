@@ -136,6 +136,169 @@ def test_apply_with_webhook_retry_times_out(monkeypatch):
         d._apply_with_webhook_retry("dummy.yaml", timeout=0.05, interval=0.01)
 
 
+def test_wait_for_ready_fails_fast_on_persistent_error(monkeypatch):
+    """wait_for_ready should fail fast when any Ready=False condition with the
+    same reason+message persists across 3 consecutive polls, regardless of the
+    specific reason string (RBAC, missing CRD, webhook, etc.)."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    def fake_kubectl(*args, **kwargs):
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                return "SchedulerReconcileError"
+            if "message}" in str(arg):
+                return (
+                    'roles.rbac.authorization.k8s.io "epp-role" is forbidden: '
+                    "user is attempting to grant RBAC permissions not currently held"
+                )
+            if "CrashLoopBackOff" in str(arg) or "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+
+    logs = []
+    with pytest.raises(RuntimeError, match="Persistent controller error.*SchedulerReconcileError.*RBAC permissions"):
+        d.wait_for_ready(tc, timeout=600, print_fn=logs.append)
+
+    # Should have logged the message field
+    assert any("RBAC permissions" in line for line in logs), f"Expected RBAC error message in log output, got: {logs}"
+
+
+def test_wait_for_ready_fails_fast_on_any_repeated_error(monkeypatch):
+    """Any controller error reason should trigger fast-fail when it persists,
+    not just a hardcoded list."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    def fake_kubectl(*args, **kwargs):
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                return "SomeFutureUnknownError"
+            if "message}" in str(arg):
+                return "CRD llm-d.ai/v1 InferenceObjective not found on the cluster"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="Persistent controller error.*SomeFutureUnknownError.*not found"):
+        d.wait_for_ready(tc, timeout=600, print_fn=lambda _: None)
+
+
+def test_wait_for_ready_does_not_fast_fail_on_changing_reasons(monkeypatch):
+    """If the error reason/message keeps changing between polls, that
+    indicates the controller is making progress -- do NOT fast-fail."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    poll = 0
+
+    def fake_kubectl(*args, **kwargs):
+        nonlocal poll
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                poll += 1
+                # Return a different reason each poll
+                return f"TransientError{poll}"
+            if "message}" in str(arg):
+                return f"Some transient message variant {poll}"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+
+    # Should time out normally, NOT raise RuntimeError
+    with pytest.raises(TimeoutError, match="not ready after"):
+        d.wait_for_ready(tc, timeout=0.01, print_fn=lambda _: None)
+
+
+def test_wait_for_ready_includes_message_in_timeout(monkeypatch):
+    """When wait_for_ready times out, the TimeoutError should include the last
+    known reason and message for actionable diagnostics."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    poll = 0
+
+    def fake_kubectl(*args, **kwargs):
+        nonlocal poll
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                poll += 1
+                return f"TransientReason{poll}"
+            if "message}" in str(arg):
+                return f"Controller is retrying something (attempt {poll})"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+
+    with pytest.raises(TimeoutError, match=r"not ready after.*TransientReason.*Controller is retrying"):
+        d.wait_for_ready(tc, timeout=0.01, print_fn=lambda _: None)
+
+
+def test_wait_for_ready_logs_message_field(monkeypatch):
+    """wait_for_ready should include the condition .message in progress logs."""
+    from conformance.deployer import Deployer
+    from conformance.config import load_testcase
+
+    d = Deployer()
+    tc = load_testcase("configs/testcases/single-gpu-smoke.yaml")
+
+    def fake_kubectl(*args, **kwargs):
+        for arg in args:
+            if "status}" in str(arg) and "Ready" in str(arg) and "message" not in str(arg) and "reason" not in str(arg):
+                return "False"
+            if "reason}" in str(arg):
+                return "SchedulerReconcileError"
+            if "message}" in str(arg):
+                return "Missing RBAC permissions for llm-d.ai resources"
+            if "containerStatuses" in str(arg):
+                return ""
+        return ""
+
+    monkeypatch.setattr(d, "kubectl", fake_kubectl)
+    monkeypatch.setattr("conformance.deployer.time.sleep", lambda _: None)
+
+    logs = []
+    with pytest.raises(RuntimeError):
+        d.wait_for_ready(tc, timeout=600, print_fn=logs.append)
+
+    # Verify message field appears in log output
+    assert any("message=" in line and "Missing RBAC" in line for line in logs), (
+        f"Expected condition message in log lines, got: {logs}"
+    )
+
+
 def test_apply_with_webhook_retry_does_not_retry_unrelated_connectivity_errors(monkeypatch):
     """Connectivity substrings alone (no 'webhook' mention) must not trigger retries.
 
