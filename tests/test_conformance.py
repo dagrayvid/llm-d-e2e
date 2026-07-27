@@ -76,13 +76,25 @@ class TestConformance:
         _require_manifest(tc)
         found = deployer.check_crd_exists(LLMISVC_CRD)
         _log(f"CRD {LLMISVC_CRD}: {'found' if found else 'NOT FOUND'}")
-        assert found, f"CRD {LLMISVC_CRD} not found"
+        if not found:
+            image_issues = deployer._check_operator_image_issues()
+            if image_issues:
+                _log("Operator image pull failures detected:")
+                for issue in image_issues:
+                    _log(f"  {issue}")
+                assert False, (
+                    f"CRD {LLMISVC_CRD} not found — operator pods have image pull failures:\n  "
+                    + "\n  ".join(image_issues)
+                )
+            assert False, f"CRD {LLMISVC_CRD} not found"
 
     def test_02_deploy(self, deployer: Deployer, tc: TestCase, test_mode: str):
         """Deploy the LLMInferenceService manifest."""
         if test_mode == "discover":
             pytest.skip("discover mode — skipping deploy")
         _require_manifest(tc)
+        if not deployer.check_crd_exists(LLMISVC_CRD):
+            pytest.skip(f"CRD {LLMISVC_CRD} not found — cannot deploy")
         _log(f"Deploying {tc.deployment.manifest_path} as '{tc.name}'")
         result = deployer.deploy(tc)
         _log(f"Deploy {'succeeded' if result.success else 'FAILED'} in {result.duration:.1f}s")
