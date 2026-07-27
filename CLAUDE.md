@@ -40,6 +40,16 @@ uv run llm-d-e2e --list-profiles                      # list available profiles
 uv run llm-d-e2e -t single-gpu --platform ocp --pull-secret my-secret --bearer-token $TOKEN
 uv run llm-d-e2e -t single-gpu --disable-auth         # strip WASM auth annotation from manifest
 
+# Storage / model caching
+uv run llm-d-e2e -t single-gpu --model-source pvc --storage-class my-sc --storage-size 50Gi
+
+# Benchmark
+uv run llm-d-e2e -t pd-performance --guidellm-image ghcr.io/vllm-project/guidellm:v0.6.0
+
+# P/D node placement
+uv run llm-d-e2e -t pd --decode-node-selector kubernetes.io/hostname=gpu-node-1
+uv run llm-d-e2e -t pd --prefill-node-selector kubernetes.io/hostname=gpu-node-2
+
 # Run a single conformance phase (by method name prefix)
 uv run pytest tests/test_conformance.py -k "test_09_inference" --testcase single-gpu
 ```
@@ -73,6 +83,18 @@ The `--mode` flag controls which phases execute:
 
 **CrashLoopBackOff early detection**: `wait_for_pods()` and `wait_for_ready()` poll for CrashLoopBackOff every 15s. After 3 consecutive detections (~45s), the deploy is failed immediately instead of waiting the full timeout (which can be 30+ minutes).
 
+**Persistent controller error fast-fail**: `wait_for_ready()` also polls the `Ready` condition's `reason` and `message` fields. If the same reason+message pair persists across 3 consecutive polls, it raises `RuntimeError` immediately with the reason and message (avoiding the full timeout wait). If the reason keeps changing between polls, that indicates the controller is making progress and the poll continues normally.
+
+**Operator image pull detection**: Both `test_01_prereq` (CRD not found) and `wait_for_ready()` (persistent error and timeout paths) call `_check_operator_image_issues()`, which scans pods in `OPERATOR_NAMESPACES` (`redhat-ods-applications`, `redhat-ods-operator`, `rhaii`) for `ImagePullBackOff`/`ErrImagePull` states. If found, the failing image name is appended to the error so the root cause is immediately visible.
+
+### Webhook and CRD transient error retry
+
+`deployer.py:_apply_with_webhook_retry()` wraps `kubectl apply` with retry logic for errors that are transient at deploy/upgrade time:
+- Webhook not ready yet (`failed calling webhook`, `no endpoints available for service`)
+- CRD not found due to stale API discovery (`the server could not find the requested resource`, `no matches for kind`)
+
+Non-webhook errors (bad manifest fields, RBAC, etc.) are re-raised immediately without retry. Retries continue until the grace period expires, then raise with a "waiting for webhook" message.
+
 ### Fixture scoping
 
 - **Session-scoped**: `deployer` (one kubectl wrapper per run), `report` (finalized at session end)
@@ -81,7 +103,7 @@ The `--mode` flag controls which phases execute:
 ### Source modules (`src/conformance/`)
 
 - **config.py** — Dataclass config types and YAML loaders. YAML keys are camelCase, Python fields are snake_case; `_build()` handles recursive conversion.
-- **deployer.py** — `Deployer`: manages LLMInferenceService lifecycle via `kubectl` subprocess calls. Handles deploy, wait-for-ready, port-forwarding (gateway and direct pod), manifest patching (mock image, pull secrets, auth disable), EPP metrics RBAC setup/teardown, and cleanup. All cluster interaction is subprocess `kubectl` — no Python K8s client.
+- **deployer.py** — `Deployer`: manages LLMInferenceService lifecycle via `kubectl` subprocess calls. Handles deploy, wait-for-ready, port-forwarding (gateway and direct pod), manifest patching (mock image, pull secrets, auth disable), EPP metrics RBAC setup/teardown, pull secret propagation between namespaces, gateway namespace allowance patching, and cleanup. All cluster interaction is subprocess `kubectl` — no Python K8s client.
 - **client.py** — `LLMClient`: OpenAI-compatible HTTP client (httpx) for `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`.
 - **metrics.py** — `Scraper`: scrapes Prometheus metrics from pods via `kubectl exec` (python3/wget), falling back to port-forward + httpx for containers without those tools (simulator, distroless). Supports bearer token auth for EPP metrics (`--metrics-endpoint-auth=true`). `parse_prometheus()` parses text exposition format. Per-topology validators: `validate_vllm_basic`, `validate_cache_aware`, `validate_pd`, `validate_scheduler`.
 - **model.py** — `ModelDownloader`: creates PVCs and download Jobs for pre-caching models from HuggingFace.
@@ -99,7 +121,7 @@ The `--mode` flag controls which phases execute:
 - **configs/testcases/*.yaml** — Each file maps to one `TestCase` dataclass. Contains model info, deployment spec (manifest path, replicas, resources, timeouts), validation criteria (prompts, retry config), and metrics check flags.
 - **configs/profiles/*.yaml** — Named groups of test case names (e.g., `smoke`, `all`, `pd`).
 - **deploy/manifests/*.yaml** — LLMInferenceService manifests, cloned from [llm-d-conformance-manifests](https://github.com/aneeshkp/llm-d-conformance-manifests) via `--setup`. Gitignored.
-- **deploy/manifests/.manifest-ref** — YAML file tracking the active manifest branch, repo URL, commit SHA, and clone timestamp. Written by `--setup` / `make setup`, read by `report.py` to include manifest provenance in test reports.
+- **deploy/manifests/.manifest-ref** — YAML file tracking the active manifest branch, repo URL, commit SHA, and clone timestamp. Written by `--setup` / `make setup`, read by `report.py` to include manifest provenance in test reports. `--setup` prunes stale YAML files before copying new ones — switching branches removes files that don't exist in the new branch.
 
 ### vLLM Simulator (`--mock`)
 
@@ -159,6 +181,8 @@ Health (`/health`) and models (`/v1/models`) endpoints return 503 when routed th
 
 The gateway service name (`inference-gateway-istio`) and its namespace (`redhat-ods-applications`) are hardcoded in `deployer.py:_ensure_port_forward()`. These are RHOAI-specific values; clusters running upstream KServe with a different gateway name will need these changed.
 
+During deploy, `deployer.py:ensure_gateway_allows_namespace()` patches the `inference-gateway` Gateway resource in `redhat-ods-applications` to set `allowedRoutes.namespaces.from: All` if it isn't already, so the test namespace's HTTPRoutes are accepted.
+
 ### EPP metrics auth
 
 The EPP's `--metrics-endpoint-auth=true` flag (default in RHOAI 3.5+) requires bearer token auth to scrape `/metrics` on port 9090. During deploy, `Deployer.ensure_metrics_rbac()` creates a `ClusterRoleBinding` granting the EPP's service account access to `kserve-metrics-reader-cluster-role`. The scraper generates a token via `kubectl create token` and passes it as a bearer header. The binding is cleaned up during `Deployer.cleanup()`.
@@ -174,6 +198,7 @@ EPP pod discovery uses multiple label patterns (`EPP_LABELS` in `metrics.py`) be
 - Health/models go directly to pods; inference goes through the gateway — the EPP only routes inference requests.
 - Metrics scraping tries `kubectl exec` first (python3, wget), falls back to port-forward + httpx for minimal container images.
 - Global pytest timeout is 21600s (6 hours) to accommodate slow model downloads and pod startup.
+- Pull secrets are automatically propagated from operator namespaces (`rhaii`, `redhat-ods-applications`, `default`) into the test namespace when `--pull-secret` is specified.
 
 ## Container Image
 
