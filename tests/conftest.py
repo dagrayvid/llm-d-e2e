@@ -42,6 +42,7 @@ def pytest_addoption(parser):
     parser.addoption("--pull-secret", default="", help="Pull secret name")
     parser.addoption("--bearer-token", default="", help="Bearer token for auth")
     parser.addoption("--disable-auth", action="store_true", help="Disable WASM auth")
+    parser.addoption("--create-gateway", action="store_true", help="Create a dedicated gateway in the test namespace")
     parser.addoption("--nocleanup", action="store_true", help="Keep resources after test")
     parser.addoption("--storage-class", default="", help="StorageClass for PVC")
     parser.addoption("--storage-size", default="", help="Override PVC size")
@@ -85,6 +86,7 @@ def deployer(request) -> Deployer:
         render_image=request.config.getoption("--render-image"),
         pull_secret=request.config.getoption("--pull-secret"),
         disable_auth=request.config.getoption("--disable-auth"),
+        create_gateway=request.config.getoption("--create-gateway"),
         node_selector=request.config.getoption("--node-selector"),
         decode_node_selector=request.config.getoption("--decode-node-selector"),
         prefill_node_selector=request.config.getoption("--prefill-node-selector"),

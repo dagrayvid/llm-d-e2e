@@ -55,6 +55,7 @@ class Deployer:
         render_image: str = "",
         pull_secret: str = "",
         disable_auth: bool = False,
+        create_gateway: bool = False,
         manifest_dir: str = "deploy/manifests",
         node_selector: str = "",
         decode_node_selector: str = "",
@@ -68,6 +69,7 @@ class Deployer:
         self._render_image_override = render_image
         self.pull_secret = pull_secret
         self.disable_auth = disable_auth
+        self.create_gateway = create_gateway
         self.manifest_dir = Path(manifest_dir)
         self.node_selector = _parse_node_selector(node_selector)
         self.decode_node_selector = _parse_node_selector(decode_node_selector)
@@ -79,6 +81,9 @@ class Deployer:
         self._pod_pf_name: str = ""
         self._deployed: set[str] = set()
         self._render_image_cached: str | None = None
+        self._gateway_svc: str = ""
+        self._gateway_ns: str = ""
+        self._gateway_port: int = 80
 
     @property
     def render_image(self) -> str:
@@ -183,6 +188,83 @@ class Deployer:
             log.info("Patched inference-gateway to allow routes from all namespaces")
         except RuntimeError as e:
             log.warning("Could not patch gateway allowedRoutes: %s", e)
+
+    _E2E_GATEWAY_NAME = "e2e-gateway"
+    _E2E_GATEWAY_CLASS = "openshift-default"
+    _E2E_GATEWAY_CONFIG = "e2e-gateway-config"
+
+    def setup_gateway(self):
+        """Create a dedicated Gateway in the test namespace and wait for it to be programmed."""
+        config_map = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": self._E2E_GATEWAY_CONFIG, "namespace": self.namespace},
+            "data": {"service": "spec:\n  type: ClusterIP\n"},
+        }
+        gateway = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": {"name": self._E2E_GATEWAY_NAME, "namespace": self.namespace},
+            "spec": {
+                "gatewayClassName": self._E2E_GATEWAY_CLASS,
+                "infrastructure": {
+                    "parametersRef": {"group": "", "kind": "ConfigMap", "name": self._E2E_GATEWAY_CONFIG},
+                },
+                "listeners": [
+                    {
+                        "name": "http",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "allowedRoutes": {"namespaces": {"from": "Same"}},
+                    }
+                ],
+            },
+        }
+        resources = [config_map, gateway]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump_all(resources, f)
+            tmp_path = f.name
+        try:
+            self.kubectl("apply", "-n", self.namespace, "-f", tmp_path)
+            log.info("Created gateway %s in %s", self._E2E_GATEWAY_NAME, self.namespace)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        self._discover_gateway_service()
+
+    def _discover_gateway_service(self, timeout: float = 120):
+        """Wait for the gateway to be Programmed and discover its backing service."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.kubectl(
+                "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
+                "-o", "jsonpath={.status.conditions[?(@.type=='Programmed')].status}",
+                check=False,
+            )
+            if status == "True":
+                addr = self.kubectl(
+                    "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
+                    "-o", "jsonpath={.status.addresses[0].value}",
+                )
+                parts = addr.replace(".svc.cluster.local", "").rsplit(".", 1)
+                self._gateway_svc = f"svc/{parts[0]}"
+                self._gateway_ns = parts[1] if len(parts) > 1 else self.namespace
+                log.info("Gateway programmed: %s in %s", self._gateway_svc, self._gateway_ns)
+                return
+            time.sleep(5)
+        raise TimeoutError(f"Gateway {self._E2E_GATEWAY_NAME} not programmed after {timeout}s")
+
+    def cleanup_gateway(self):
+        """Delete the dedicated e2e gateway and its config."""
+        self.kubectl(
+            "delete", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
+            "--ignore-not-found", check=False,
+        )
+        self.kubectl(
+            "delete", "configmap", self._E2E_GATEWAY_CONFIG, "-n", self.namespace,
+            "--ignore-not-found", check=False,
+        )
+        log.info("Deleted gateway %s", self._E2E_GATEWAY_NAME)
 
     def ensure_metrics_rbac(self, name: str):
         """Bind the EPP service account to kserve-metrics-reader-cluster-role for metrics scraping."""
@@ -351,7 +433,10 @@ class Deployer:
             self._ensure_clean_slate(tc.name)
             for secret_name in self._collect_pull_secrets(manifest):
                 self.ensure_pull_secret(secret_name)
-            self.ensure_gateway_allows_namespace()
+            if self.create_gateway:
+                self.setup_gateway()
+            else:
+                self.ensure_gateway_allows_namespace()
             self._apply_with_webhook_retry(tmp_path)
             self.ensure_metrics_rbac(tc.name)
             result.success = True
@@ -559,14 +644,18 @@ class Deployer:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                output = self.kubectl(
-                    "get",
-                    "gateway",
-                    "-A",
-                    "-o",
-                    "jsonpath={.items[0].status.addresses[0].value}",
-                    check=False,
-                )
+                if self.create_gateway:
+                    output = self.kubectl(
+                        "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
+                        "-o", "jsonpath={.status.addresses[0].value}",
+                        check=False,
+                    )
+                else:
+                    output = self.kubectl(
+                        "get", "gateway", "-A",
+                        "-o", "jsonpath={.items[0].status.addresses[0].value}",
+                        check=False,
+                    )
                 if output:
                     return output
             except RuntimeError:
@@ -680,15 +769,21 @@ class Deployer:
             return f"http://localhost:{self._port_forward_port}{path}"
 
         local_port = self._find_free_port()
-        gateway_svc = "svc/inference-gateway-istio"
-        gateway_ns = "redhat-ods-applications"
+        if self.create_gateway and self._gateway_svc:
+            gateway_svc = self._gateway_svc
+            gateway_ns = self._gateway_ns
+            gateway_port = self._gateway_port
+        else:
+            gateway_svc = "svc/inference-gateway-istio"
+            gateway_ns = "redhat-ods-applications"
+            gateway_port = 80
 
         cmd = ["kubectl"]
         if self.kubeconfig:
             cmd += ["--kubeconfig", self.kubeconfig]
-        cmd += ["port-forward", "-n", gateway_ns, gateway_svc, f"{local_port}:80"]
+        cmd += ["port-forward", "-n", gateway_ns, gateway_svc, f"{local_port}:{gateway_port}"]
 
-        log.info("Starting port-forward: localhost:%d → %s:80", local_port, gateway_svc)
+        log.info("Starting port-forward: localhost:%d → %s:%d", local_port, gateway_svc, gateway_port)
         self._port_forward_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._port_forward_port = local_port
 
@@ -760,6 +855,8 @@ class Deployer:
         log.info("Cleaning up %s", tc.name)
         self._deployed.discard(tc.name)
         self.cleanup_metrics_rbac(tc.name)
+        if self.create_gateway:
+            self.cleanup_gateway()
         self.kubectl(
             "delete",
             "llminferenceservice",
@@ -821,6 +918,12 @@ class Deployer:
         if self.disable_auth:
             annotations = manifest.setdefault("metadata", {}).setdefault("annotations", {})
             annotations["serving.kserve.io/disable-auth"] = "true"
+
+        if self.create_gateway:
+            router = spec.setdefault("router", {})
+            router.setdefault("gateway", {})["refs"] = [
+                {"name": self._E2E_GATEWAY_NAME, "namespace": self.namespace}
+            ]
 
         if self.node_selector:
             spec.setdefault("template", {})["nodeSelector"] = self.node_selector

@@ -60,6 +60,9 @@ def main():
     parser.add_argument("--decode-node-selector", default="", help="Node selector for decode pods (key=value, overrides --node-selector)")
     parser.add_argument("--prefill-node-selector", default="", help="Node selector for prefill pods (key=value, overrides --node-selector)")
 
+    # Gateway
+    parser.add_argument("--create-gateway", action="store_true", help="Create a dedicated gateway in the test namespace")
+
     # Behavior
     parser.add_argument("--nocleanup", action="store_true", help="Keep resources after test")
     parser.add_argument("--report-dir", default="reports", help="Report output directory")
@@ -133,6 +136,8 @@ def main():
         if val:
             pytest_args.extend([flag, val])
 
+    if args.create_gateway:
+        pytest_args.append("--create-gateway")
     if args.disable_auth:
         pytest_args.append("--disable-auth")
     if args.nocleanup:
