@@ -511,11 +511,8 @@ class Deployer:
                 if status == "True":
                     return True
 
-                # Fail fast on any persistent controller error: if the same
-                # non-empty reason+message pair repeats across 3 consecutive
-                # polls (~45s), the error is unlikely to self-heal (RBAC,
-                # missing CRD, webhook misconfiguration, etc.).
-                if status == "False" and reason != "waiting" and message:
+                _TRANSIENT_REASONS = {"MinimumReplicasUnavailable"}
+                if status == "False" and reason != "waiting" and message and reason not in _TRANSIENT_REASONS:
                     error_key = f"{reason}:{message}"
                     if error_key == _prev_error_key:
                         _error_repeat_count += 1
@@ -546,6 +543,12 @@ class Deployer:
                         raise RuntimeError(f"Pods in CrashLoopBackOff for {name}: {', '.join(crash_pods)}")
                 else:
                     crashloop_count = 0
+
+                pull_pods = self._check_image_pull(name)
+                if pull_pods:
+                    if print_fn:
+                        print_fn(f"ImagePullBackOff detected: {', '.join(pull_pods)}")
+                    raise RuntimeError(f"Pods in ImagePullBackOff for {name}: {', '.join(pull_pods)}")
             except RuntimeError:
                 raise
             except Exception:
@@ -580,6 +583,31 @@ class Deployer:
             if len(parts) == 2 and "CrashLoopBackOff" in parts[1]:
                 crash_pods.append(parts[0])
         return crash_pods
+
+    def _check_image_pull(self, name: str) -> list[str]:
+        """Return pod names stuck in ImagePullBackOff/ErrImagePull for this LLMInferenceService."""
+        output = self.kubectl(
+            "get",
+            "pods",
+            "-n",
+            self.namespace,
+            "-l",
+            f"app.kubernetes.io/name={name}",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}="
+            "{range .status.containerStatuses[*]}{.state.waiting.reason} {end}"
+            "{range .status.initContainerStatuses[*]}{.state.waiting.reason} {end}"
+            "\\n{end}",
+            check=False,
+        )
+        pull_pods = []
+        for line in (output or "").strip().splitlines():
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                reasons = parts[1].strip()
+                if any(r in reasons for r in _IMAGE_PULL_FAILURE_REASONS):
+                    pull_pods.append(parts[0])
+        return pull_pods
 
     def _check_operator_image_issues(self) -> list[str]:
         """Scan operator namespaces for pods stuck in ImagePullBackOff/ErrImagePull."""
@@ -708,6 +736,12 @@ class Deployer:
                         raise RuntimeError(f"Pods in CrashLoopBackOff for {name}: {', '.join(crash_pods)}")
                 else:
                     crashloop_count = 0
+
+                pull_pods = self._check_image_pull(name)
+                if pull_pods:
+                    if print_fn:
+                        print_fn(f"ImagePullBackOff detected: {', '.join(pull_pods)}")
+                    raise RuntimeError(f"Pods in ImagePullBackOff for {name}: {', '.join(pull_pods)}")
             except RuntimeError:
                 raise
             except Exception:
