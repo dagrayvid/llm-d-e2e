@@ -237,14 +237,24 @@ class Deployer:
         deadline = time.time() + timeout
         while time.time() < deadline:
             status = self.kubectl(
-                "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
-                "-o", "jsonpath={.status.conditions[?(@.type=='Programmed')].status}",
+                "get",
+                "gateway",
+                self._E2E_GATEWAY_NAME,
+                "-n",
+                self.namespace,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type=='Programmed')].status}",
                 check=False,
             )
             if status == "True":
                 addr = self.kubectl(
-                    "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
-                    "-o", "jsonpath={.status.addresses[0].value}",
+                    "get",
+                    "gateway",
+                    self._E2E_GATEWAY_NAME,
+                    "-n",
+                    self.namespace,
+                    "-o",
+                    "jsonpath={.status.addresses[0].value}",
                 )
                 parts = addr.replace(".svc.cluster.local", "").rsplit(".", 1)
                 self._gateway_svc = f"svc/{parts[0]}"
@@ -257,12 +267,22 @@ class Deployer:
     def cleanup_gateway(self):
         """Delete the dedicated e2e gateway and its config."""
         self.kubectl(
-            "delete", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
-            "--ignore-not-found", check=False,
+            "delete",
+            "gateway",
+            self._E2E_GATEWAY_NAME,
+            "-n",
+            self.namespace,
+            "--ignore-not-found",
+            check=False,
         )
         self.kubectl(
-            "delete", "configmap", self._E2E_GATEWAY_CONFIG, "-n", self.namespace,
-            "--ignore-not-found", check=False,
+            "delete",
+            "configmap",
+            self._E2E_GATEWAY_CONFIG,
+            "-n",
+            self.namespace,
+            "--ignore-not-found",
+            check=False,
         )
         log.info("Deleted gateway %s", self._E2E_GATEWAY_NAME)
 
@@ -674,14 +694,22 @@ class Deployer:
             try:
                 if self.create_gateway:
                     output = self.kubectl(
-                        "get", "gateway", self._E2E_GATEWAY_NAME, "-n", self.namespace,
-                        "-o", "jsonpath={.status.addresses[0].value}",
+                        "get",
+                        "gateway",
+                        self._E2E_GATEWAY_NAME,
+                        "-n",
+                        self.namespace,
+                        "-o",
+                        "jsonpath={.status.addresses[0].value}",
                         check=False,
                     )
                 else:
                     output = self.kubectl(
-                        "get", "gateway", "-A",
-                        "-o", "jsonpath={.items[0].status.addresses[0].value}",
+                        "get",
+                        "gateway",
+                        "-A",
+                        "-o",
+                        "jsonpath={.items[0].status.addresses[0].value}",
                         check=False,
                     )
                 if output:
@@ -955,9 +983,7 @@ class Deployer:
 
         if self.create_gateway:
             router = spec.setdefault("router", {})
-            router.setdefault("gateway", {})["refs"] = [
-                {"name": self._E2E_GATEWAY_NAME, "namespace": self.namespace}
-            ]
+            router.setdefault("gateway", {})["refs"] = [{"name": self._E2E_GATEWAY_NAME, "namespace": self.namespace}]
 
         if self.node_selector:
             spec.setdefault("template", {})["nodeSelector"] = self.node_selector

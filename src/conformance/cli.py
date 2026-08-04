@@ -57,11 +57,21 @@ def main():
 
     # Node placement
     parser.add_argument("--node-selector", default="", help="Node selector for all pods (key=value)")
-    parser.add_argument("--decode-node-selector", default="", help="Node selector for decode pods (key=value, overrides --node-selector)")
-    parser.add_argument("--prefill-node-selector", default="", help="Node selector for prefill pods (key=value, overrides --node-selector)")
+    parser.add_argument(
+        "--decode-node-selector",
+        default="",
+        help="Node selector for decode pods (key=value, overrides --node-selector)",
+    )
+    parser.add_argument(
+        "--prefill-node-selector",
+        default="",
+        help="Node selector for prefill pods (key=value, overrides --node-selector)",
+    )
 
     # Gateway
-    parser.add_argument("--create-gateway", action="store_true", help="Create a dedicated gateway in the test namespace")
+    parser.add_argument(
+        "--create-gateway", action="store_true", help="Create a dedicated gateway in the test namespace"
+    )
 
     # Behavior
     parser.add_argument("--nocleanup", action="store_true", help="Keep resources after test")
