@@ -56,6 +56,7 @@ class Deployer:
         pull_secret: str = "",
         disable_auth: bool = False,
         manifest_dir: str = "deploy/manifests",
+        node_selector: str = "",
         decode_node_selector: str = "",
         prefill_node_selector: str = "",
     ):
@@ -68,6 +69,7 @@ class Deployer:
         self.pull_secret = pull_secret
         self.disable_auth = disable_auth
         self.manifest_dir = Path(manifest_dir)
+        self.node_selector = _parse_node_selector(node_selector)
         self.decode_node_selector = _parse_node_selector(decode_node_selector)
         self.prefill_node_selector = _parse_node_selector(prefill_node_selector)
         self._port_forward_proc: subprocess.Popen | None = None
@@ -819,6 +821,15 @@ class Deployer:
         if self.disable_auth:
             annotations = manifest.setdefault("metadata", {}).setdefault("annotations", {})
             annotations["serving.kserve.io/disable-auth"] = "true"
+
+        if self.node_selector:
+            spec.setdefault("template", {})["nodeSelector"] = self.node_selector
+            prefill = spec.get("prefill", {})
+            if prefill:
+                prefill.setdefault("template", {})["nodeSelector"] = self.node_selector
+            router_tmpl = spec.get("router", {}).get("scheduler", {}).get("template")
+            if router_tmpl is not None:
+                router_tmpl["nodeSelector"] = self.node_selector
 
         if self.decode_node_selector:
             spec.setdefault("template", {})["nodeSelector"] = self.decode_node_selector
